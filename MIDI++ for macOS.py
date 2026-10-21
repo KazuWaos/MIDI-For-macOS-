@@ -5,6 +5,8 @@ MIDI++ para macOS  -  autoplayer MIDI -> QWERTY para pianos virtuales (Virtual P
 
 Reimplementación en Python/tkinter inspirada en MIDI++ de Zephkek (Windows, GPL-3.0):
 https://github.com/Zephkek/MIDIPlusPlus  -  esto NO es su código, es una copia funcional para macOS.
+La gestión de teclas físicas compartidas toma como referencia conceptual el contador de notas
+del original; los eventos de teclado siguen implementados con Quartz para macOS.
 
 INSTALACIÓN (una vez, en Terminal):
     python3 -m pip install mido python-rtmidi pyobjc-framework-Quartz \
@@ -13,6 +15,7 @@ INSTALACIÓN (una vez, en Terminal):
 
 EJECUTAR:
     python3 midiplusplus_mac.py
+
 
 PERMISOS: Ajustes del Sistema > Privacidad y seguridad > Accesibilidad (y Monitorización de entrada)
           -> activa la app desde la que lo ejecutas (Terminal, iTerm, VS Code...).
@@ -23,11 +26,12 @@ CARPETAS (junto al script, se crean solas):
 
 FUNCIONES
   Playback  : Load, Play/Pause, Restart, Stop, Skip +10, Rew -10, Speed++/--, barra clicable, Loop
-  MidiConnect / Midi2Key : conecta un teclado MIDI (p. ej. tu Arduino) y lo convierte a teclas en vivo
+  MidiConnect : protocolo numérico del MIDI++ original para juegos de piano compatibles
+  Midi2Key    : convierte cada nota MIDI a la tecla QWERTY equivalente en vivo
   Advanced  : 88-Key, AutoVol, Velocity (32 pasos + curvas + editor), Sustain (+ Sustain Cutoff),
               Transpose (automático por análisis de rango/teclas negras, o manual), OutRange (plegar octavas)
   Config    : Always On Top, Legit Mode (humanización), Filter Drums, Opacity, Note Mode LIFO/FIFO,
-              filtro de app / pausa si pierdes el foco, salida a teclas / puerto MIDI virtual
+              filtro de app / pausa si pierdes el foco, salida QWERTY / MidiConnect / puerto MIDI
   Tracks    : M (mute), S (solo), instrumento GM, Solo Piano
   Atajos globales remapeables (funcionan con el foco en el navegador). Por defecto:
       ESC detener · Ctrl+Opción+P pausa · +R reiniciar · +→/← saltar ±10 s · +↑/↓ velocidad
@@ -132,6 +136,13 @@ NOMBRE_A_CODIGO.update(ESPECIALES)
 CODIGO_A_NOMBRE = {v: k for k, v in NOMBRE_A_CODIGO.items()}
 KEY_SPACE, KEY_ESC = 49, 53
 
+# MIDIConnect del original codifica cada mensaje como una secuencia de teclado
+# numérico para los pianos de Roblox compatibles con ese protocolo.
+# Orden equivalente a NUMPAD_SCANCODES del MIDI++ original: 0–9, numpad −,
+# numpad +. El asterisco (67) es el prefijo y va por separado.
+MIDICONNECT_NUMPAD = (82, 83, 84, 85, 86, 87, 88, 89, 91, 92, 78, 69)
+MIDICONNECT_PREFIX = 67  # multiplicación del teclado numérico
+
 MOD_CODIGOS = {
     'cmd': (54, 55), 'shift': (56, 60), 'opt': (58, 61), 'ctrl': (59, 62),
 }
@@ -140,8 +151,8 @@ MOD_SIMBOLO = {'ctrl': '⌃', 'opt': '⌥', 'shift': '⇧', 'cmd': '⌘'}
 
 _SRC = CGEventSourceCreate(kCGEventSourceStatePrivate)
 
-# Teclas físicas de modificador de macOS. Se mantienen presionadas mientras
-# haya al menos una nota generada que dependa de ellas.
+# Teclas físicas de modificador de macOS. Se pulsan brevemente al atacar una
+# nota; la tecla principal queda pulsada hasta su note-off.
 MOD_EVENTOS = ((SHIFT, 56), (CTRL, 59), (ALT, 58), (CMD, 55))
 
 
@@ -503,8 +514,12 @@ def compilar(c, cfg):
     evento = (tiempo, orden, tipo, abajo, keycode, flags, nota, vel)   tipo 0=nota 1=pedal"""
     lo, hi = rango_teclas(cfg)
     notas = notas_filtradas(c, cfg)
-    t_eff = auto_transponer(notas, cfg) if cfg['auto'] else cfg['transp']
-    av = autovol_params(notas) if cfg['autovol'] else None
+    midi_connect = cfg.get('salida') == 'midiconnect'
+    # MidiConnect transmite el pitch y la velocity MIDI sin convertirlos a
+    # teclas QWERTY ni plegarlos al rango del layout.
+    t_eff = (0 if cfg['auto'] else cfg['transp']) if midi_connect else (
+        auto_transponer(notas, cfg) if cfg['auto'] else cfg['transp'])
+    av = autovol_params(notas) if cfg['autovol'] and not midi_connect else None
     rng = random.Random(1337)
     legit = cfg['legit']
     jit, spread = cfg['jitter'] / 1000.0, cfg['spread'] / 1000.0
@@ -527,17 +542,24 @@ def compilar(c, cfg):
     por_tecla = defaultdict(list)
     fuera = 0
     for idx, (ini, fin, nota, pi, ch, vel) in enumerate(notas):
-        res, f = mapear(cfg, nota, t_eff, lo, hi)
-        if f:
-            fuera += 1
-        if res is None:
-            continue
-        n, kc, fl = res
+        if midi_connect:
+            n = int(nota) + int(t_eff)
+            if not 0 <= n <= 127:
+                fuera += 1
+                continue
+            kc, fl = 0, 0
+        else:
+            res, f = mapear(cfg, nota, t_eff, lo, hi)
+            if f:
+                fuera += 1
+            if res is None:
+                continue
+            n, kc, fl = res
         v = vel
         if av:
             a, b = av
             v = int(max(1, min(127, 24 + (vel - a) / float(b - a) * (127 - 24))))
-        if cfg['velocity']:
+        if cfg['velocity'] and not midi_connect:
             nivel = cfg['curva'][min(31, max(0, v // 4))]
             vout = nivel_a_vel(nivel)
             if cfg['vel_mod'] == 'alt' and nivel < cfg['vel_thr']:
@@ -548,12 +570,12 @@ def compilar(c, cfg):
             dur = fin - ini
             ini = max(0.0, ini + rng.uniform(-jit, jit) + offs.get(idx, 0.0))
             fin = ini + dur * rng.uniform(0.85, 1.1)
-        por_tecla[(kc, fl)].append([ini, fin, n, vout])
+        por_tecla[(n if midi_connect else kc, fl)].append([ini, fin, n, vout, kc])
 
     eventos, total = [], 0
-    for (kc, fl), lista in por_tecla.items():
+    for (grupo_tecla, fl), lista in por_tecla.items():
         lista.sort()
-        for i, (ini, fin, n, vout) in enumerate(lista):
+        for i, (ini, fin, n, vout, kc) in enumerate(lista):
             if i + 1 < len(lista):
                 sig = lista[i + 1][0]
                 if sig - ini < 0.002:
@@ -567,7 +589,10 @@ def compilar(c, cfg):
             eventos.append((fin, 0, 0, False, kc, fl, n, 0))
             total += 1
 
-    if cfg['pedal']:
+    if midi_connect:
+        for t, valor in c.pedal:
+            eventos.append((t, 1 if valor >= 64 else 0, 2, valor >= 64, 0, 0, 143, int(valor)))
+    elif cfg['pedal']:
         estado = False
         for t, valor in c.pedal:
             abajo = valor >= cfg['cutoff']
@@ -589,7 +614,13 @@ class Salida:
         self.modo = 'keys'                 # keys | midi | both
         self.port = None
         self.sustain_key = KEY_SPACE
-        self.held_keys, self.held_notes = set(), set()
+        self.held_keys, self.held_notes, self.mc_held_notes = set(), set(), set()
+        # La implementación original mantiene un dueño y un contador por
+        # tecla física. Esto evita que un note-off atrasado suelte una nota
+        # posterior que reutilizó la misma tecla.
+        self.key_owner = {}          # keycode -> (keycode, flags)
+        self.key_counts = {}         # (keycode, flags) -> {nota MIDI: cantidad}
+        self.pedal_states = {'keys': False, 'midiconnect': False, 'midi': False}
         self.pedal_abajo = False
         self.bloqueado = False             # lo actualiza la UI (foco)
 
@@ -612,33 +643,49 @@ class Salida:
                     pass
                 self.port = None
 
-    def nota(self, abajo, kc, fl, nota, vel):
+    def nota(self, abajo, kc, fl, nota, vel, destino=None):
         with self.lock:
-            if abajo and self.bloqueado and self.modo != 'midi':
+            modo_salida = destino or self.modo
+            if abajo and self.bloqueado and modo_salida != 'midi':
                 return
-            if self.modo in ('keys', 'both'):
+            if modo_salida == 'midiconnect':
+                if abajo:
+                    self.midiconnect_evento(nota, vel)
+                    self.mc_held_notes.add(int(nota))
+                else:
+                    self.midiconnect_evento(nota, 0)
+                    self.mc_held_notes.discard(int(nota))
+            if modo_salida in ('keys', 'both'):
                 ident = (kc, fl)
                 if abajo:
-                    # Un note-on repetido para la misma tecla cierra primero
-                    # la pulsación anterior para evitar teclas atascadas.
-                    if ident in self.held_keys:
-                        self._soltar_tecla(kc, fl)
+                    actual = self.key_owner.get(kc)
+                    if actual != ident:
+                        # Una blanca y su sostenido pueden compartir la misma
+                        # tecla principal. Al cambiar de mapeo se hace handoff:
+                        # el note-off viejo ya no puede soltar la nota nueva.
+                        if actual is not None:
+                            self._soltar_tecla(*actual)
                         self._modificadores_tap(kc, fl)
                         self.held_keys.add(ident)
+                        self.key_owner[kc] = ident
+                        self.key_counts[ident] = {int(nota): 1}
                     else:
-                        # La blanca y su sostenido comparten keycode: hacer
-                        # handoff a la última nota evita volver a disparar la
-                        # anterior. El pedal puede sostener su sonido acústico.
-                        en_misma_tecla = [par for par in self.held_keys if par[0] == kc]
-                        for anterior in en_misma_tecla:
-                            _, flags_anteriores = anterior
-                            enviar(kc, False, flags_anteriores)
-                            self.held_keys.discard(anterior)
-                        self._modificadores_tap(kc, fl)
-                        self.held_keys.add(ident)
+                        # Varias notas MIDI pueden compartir una tecla. Solo
+                        # se libera cuando se recibieron todos sus note-off.
+                        cuenta = self.key_counts.setdefault(ident, {})
+                        midi_nota = int(nota)
+                        cuenta[midi_nota] = cuenta.get(midi_nota, 0) + 1
                 else:
-                    self._soltar_tecla(kc, fl)
-            if self.modo in ('midi', 'both') and self.port is not None:
+                    if self.key_owner.get(kc) == ident:
+                        cuenta = self.key_counts.get(ident, {})
+                        midi_nota = int(nota)
+                        if cuenta.get(midi_nota, 0) > 1:
+                            cuenta[midi_nota] -= 1
+                        else:
+                            cuenta.pop(midi_nota, None)
+                        if not cuenta:
+                            self._soltar_tecla(kc, fl)
+            if modo_salida in ('midi', 'both') and self.port is not None:
                 try:
                     if abajo:
                         self.port.send(mido.Message('note_on', note=int(nota), velocity=int(vel)))
@@ -663,6 +710,29 @@ class Salida:
         for flag, keycode in reversed(activos):
             enviar(keycode, False, 0)
 
+    def midiconnect_evento(self, nota, valor):
+        """Envía el protocolo MIDIConnect original mediante el teclado numérico.
+
+        No es un puerto MIDI del sistema: el juego recibe * + (nota/12) +
+        (nota%12) + (velocity/12) + (velocity%12), cada dígito como tap.
+        El juego compatible reconstruye de ahí la nota MIDI y su velocity.
+        """
+        with self.lock:
+            if self.bloqueado:
+                return
+            nota = max(0, min(143, int(nota)))
+            valor = max(0, min(127, int(valor)))
+            indices = (nota // 12, nota % 12, valor // 12, valor % 12)
+            for kc in (MIDICONNECT_PREFIX, *(MIDICONNECT_NUMPAD[i] for i in indices)):
+                enviar(kc, True, 0)
+                enviar(kc, False, 0)
+
+    def midiconnect_sustain(self, valor):
+        with self.lock:
+            self.midiconnect_evento(143, valor)
+            self.pedal_states['midiconnect'] = int(valor) >= 64
+            self.pedal_abajo = any(self.pedal_states.values())
+
     def _soltar_tecla(self, kc, fl):
         ident = (kc, fl)
         if ident not in self.held_keys:
@@ -671,27 +741,41 @@ class Salida:
         # la duración de la tecla principal.
         enviar(kc, False, fl)
         self.held_keys.discard(ident)
+        self.key_counts.pop(ident, None)
+        if self.key_owner.get(kc) == ident:
+            self.key_owner.pop(kc, None)
 
-    def pedal(self, abajo):
+    def pedal(self, abajo, destino=None):
         with self.lock:
-            if abajo == self.pedal_abajo:
-                return
-            self.pedal_abajo = abajo
-            if self.modo in ('keys', 'both'):
-                enviar(self.sustain_key, abajo, 0)
-            if self.modo in ('midi', 'both') and self.port is not None:
-                try:
-                    self.port.send(mido.Message('control_change', control=64, value=127 if abajo else 0))
-                except Exception:
-                    pass
+            modos = [destino] if destino else (['keys', 'midi'] if self.modo == 'both' else [self.modo])
+            for modo in modos:
+                if modo not in self.pedal_states or self.pedal_states[modo] == abajo:
+                    continue
+                self.pedal_states[modo] = abajo
+                if modo == 'midiconnect':
+                    self.midiconnect_evento(143, 127 if abajo else 0)
+                elif modo == 'keys':
+                    enviar(self.sustain_key, abajo, 0)
+                elif modo == 'midi' and self.port is not None:
+                    try:
+                        self.port.send(mido.Message('control_change', control=64, value=127 if abajo else 0))
+                    except Exception:
+                        pass
+            self.pedal_abajo = any(self.pedal_states.values())
 
     def soltar_todo(self):
         with self.lock:
             for kc, fl in list(self.held_keys):
                 self._soltar_tecla(kc, fl)
             self.held_keys.clear()
-            if self.pedal_abajo:
-                self.pedal(False)
+            self.key_owner.clear()
+            self.key_counts.clear()
+            for modo, activo in list(self.pedal_states.items()):
+                if activo:
+                    self.pedal(False, destino=modo)
+            for n in list(self.mc_held_notes):
+                self.midiconnect_evento(n, 0)
+            self.mc_held_notes.clear()
             if self.port is not None:
                 for n in list(self.held_notes):
                     try:
@@ -701,7 +785,7 @@ class Salida:
             self.held_notes.clear()
 
     def hay_algo(self):
-        return bool(self.held_keys or self.held_notes or self.pedal_abajo)
+        return bool(self.held_keys or self.held_notes or self.mc_held_notes or any(self.pedal_states.values()))
 
 
 # ============================================================================
@@ -717,7 +801,7 @@ class Player(threading.Thread):
             transp=0, auto=False, k88=True, fold=True, pedal=False, cutoff=64, drums=True,
             mute=set(), solo=set(), guard=True, legit=False, jitter=12, spread=8,
             velocity=False, autovol=False, curva=_curva(CURVAS_BASE["Linear Coarse"]),
-            vel_mod='alt', vel_thr=12, keymap=layout_vp88(), loop=False)
+            vel_mod='alt', vel_thr=12, keymap=layout_vp88(), loop=False, salida='keys')
         self.speed = 1.0
         self.state = 'stopped'          # stopped | playing | paused
         self.events, self.times, self.idx = [], [], 0
@@ -889,6 +973,8 @@ class Player(threading.Thread):
             _, _, tipo, abajo, kc, fl, nota, vel = ev
             if tipo == 0:
                 self.out.nota(abajo, kc, fl, nota, vel)
+            elif tipo == 2:
+                self.out.midiconnect_sustain(vel)
             else:
                 self.out.pedal(abajo)
             self.idx += 1
@@ -913,9 +999,14 @@ class EntradaMidi:
     def __init__(self, player, out, log):
         self.player, self.out, self.log = player, out, log
         self.port = None
+        self.device_name = None
         self.midi2key = False
+        self.midiconnect = False
         self.canal = None                 # None = todos
-        self.activas = {}                 # nota entrante -> (n, kc, fl)
+        self.activas = {}                 # (canal MIDI, nota) -> (n, kc, fl)
+        self.mc_activas = set()           # notas sin soltar en protocolo MIDIConnect
+        self.mc_pedal = False
+        self.lock = threading.RLock()
         self._aviso = False
 
     def dispositivos(self):
@@ -928,10 +1019,13 @@ class EntradaMidi:
             return []
 
     def conectar(self, nombre):
+        if self.port is not None and self.device_name == nombre:
+            return True
         self.desconectar()
         try:
             self.port = mido.open_input(nombre, callback=self._cb)
-            self.log(f"[MidiConnect] Conectado a: {nombre}")
+            self.device_name = nombre
+            self.log(f"[MIDI input] Conectado: {nombre}")
             return True
         except Exception as e:
             self.log(f"⚠ No pude abrir '{nombre}': {e}")
@@ -939,54 +1033,112 @@ class EntradaMidi:
             return False
 
     def desconectar(self):
-        if self.port is not None:
+        with self.lock:
+            self.midi2key = False
+            self.midiconnect = False
+            self.soltar_todo()
+            port, self.port = self.port, None
+            self.device_name = None
+        if port is not None:
             try:
-                self.port.close()
+                port.close()
             except Exception:
                 pass
-            self.port = None
             self.log("[MidiConnect] Desconectado")
-        self.soltar_todo()
 
     def soltar_todo(self):
-        for n, (nn, kc, fl) in list(self.activas.items()):
-            self.out.nota(False, kc, fl, nn, 0)
-        self.activas.clear()
+        with self.lock:
+            for nn, kc, fl in list(self.activas.values()):
+                self.out.nota(False, kc, fl, nn, 0, destino='keys')
+            self.activas.clear()
+            for nota in list(self.mc_activas):
+                self.out.midiconnect_evento(nota, 0)
+            self.mc_activas.clear()
+            if self.mc_pedal:
+                self.out.midiconnect_evento(143, 0)
+                self.mc_pedal = False
+            if self.midi2key:
+                self.out.pedal(False, destino='keys')
+
+    def set_activo(self, activo):
+        with self.lock:
+            self.midi2key = bool(activo)
+            if not self.midi2key:
+                self.soltar_todo()
+
+    def set_midiconnect(self, activo):
+        with self.lock:
+            self.midiconnect = bool(activo)
+            if self.midiconnect:
+                self.midi2key = False
+            else:
+                self.soltar_todo()
+
+    def set_canal(self, canal):
+        with self.lock:
+            canal = None if canal is None else int(canal)
+            if canal != self.canal:
+                # Si se cambia el filtro mientras hay notas pulsadas, termina
+                # las notas anteriores para que no queden teclas colgadas.
+                self.soltar_todo()
+                self.canal = canal
 
     def _cb(self, msg):
-        if not self.midi2key:
-            return
-        try:
-            if self.canal is not None and getattr(msg, 'channel', None) != self.canal:
+        with self.lock:
+            if not (self.midi2key or self.midiconnect):
                 return
-            cfg = self.player.cfg
-            if msg.type == 'note_on' and msg.velocity > 0:
-                lo, hi = rango_teclas(cfg)
-                t = cfg['transp'] if not cfg['auto'] else 0
-                res, _ = mapear(cfg, msg.note, t, lo, hi)
-                if res is None:
+            try:
+                canal = int(getattr(msg, 'channel', 0))
+                if self.canal is not None and canal != self.canal:
                     return
-                n, kc, fl = res
-                if cfg['velocity']:
-                    nivel = cfg['curva'][min(31, msg.velocity // 4)]
-                    vout = nivel_a_vel(nivel)
-                    if cfg['vel_mod'] == 'alt' and nivel < cfg['vel_thr']:
-                        fl |= ALT
-                else:
-                    vout = msg.velocity
-                if msg.note in self.activas:
-                    _, okc, ofl = self.activas[msg.note]
-                    self.out.nota(False, okc, ofl, n, 0)
-                self.activas[msg.note] = (n, kc, fl)
-                self.out.nota(True, kc, fl, n, vout)
-            elif msg.type in ('note_off', 'note_on'):
-                a = self.activas.pop(msg.note, None)
-                if a:
-                    self.out.nota(False, a[1], a[2], a[0], 0)
-            elif msg.type == 'control_change' and msg.control == 64 and cfg['pedal']:
-                self.out.pedal(msg.value >= cfg['cutoff'])
-        except Exception as e:
-            self.log(f"⚠ Midi2Key: {e}")
+                if self.midiconnect:
+                    self._procesar_midiconnect(msg, canal)
+                    return
+                cfg = self.player.cfg
+                nota_entrada = int(msg.note) if hasattr(msg, 'note') else None
+                clave_nota = (canal, nota_entrada)
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    lo, hi = rango_teclas(cfg)
+                    t = cfg['transp'] if not cfg['auto'] else 0
+                    res, _ = mapear(cfg, nota_entrada, t, lo, hi)
+                    if res is None:
+                        return
+                    n, kc, fl = res
+                    if cfg['velocity']:
+                        nivel = cfg['curva'][min(31, msg.velocity // 4)]
+                        vout = nivel_a_vel(nivel)
+                        if cfg['vel_mod'] == 'alt' and nivel < cfg['vel_thr']:
+                            fl |= ALT
+                    else:
+                        vout = msg.velocity
+                    if clave_nota in self.activas:
+                        _, okc, ofl = self.activas[clave_nota]
+                        self.out.nota(False, okc, ofl, n, 0, destino='keys')
+                    self.activas[clave_nota] = (n, kc, fl)
+                    self.out.nota(True, kc, fl, n, vout, destino='keys')
+                elif msg.type in ('note_off', 'note_on'):
+                    activa = self.activas.pop(clave_nota, None)
+                    if activa:
+                        self.out.nota(False, activa[1], activa[2], activa[0], 0, destino='keys')
+                elif msg.type == 'control_change' and msg.control == 64 and cfg['pedal']:
+                    self.out.pedal(msg.value >= cfg['cutoff'], destino='keys')
+            except Exception as e:
+                self.log(f"⚠ Midi2Key: {e}")
+
+    def _procesar_midiconnect(self, msg, canal):
+        """Protocolo del modo MIDIConnect del MIDI++ original."""
+        if msg.type == 'note_on' and msg.velocity > 0:
+            nota = int(msg.note)
+            self.out.midiconnect_evento(nota, int(msg.velocity))
+            self.mc_activas.add((canal, nota))
+        elif msg.type in ('note_off', 'note_on'):
+            nota = int(msg.note)
+            self.out.midiconnect_evento(nota, 0)
+            self.mc_activas.discard((canal, nota))
+        elif msg.type == 'control_change' and msg.control == 64:
+            valor = int(msg.value)
+            self.out.midiconnect_evento(143, valor)
+            self.mc_pedal = valor >= 64
 
 
 # ============================================================================
@@ -1121,7 +1273,12 @@ def fmt(seg):
     return f"{seg // 60}:{seg % 60:02d}"
 
 
-SALIDAS = {"Teclas (Virtual Piano)": "keys", "Puerto MIDI virtual": "midi", "Teclas + Puerto MIDI": "both"}
+SALIDAS = {
+    "Teclas (QWERTY)": "keys",
+    "MidiConnect (Roblox)": "midiconnect",
+    "Puerto MIDI virtual": "midi",
+    "Teclas + Puerto MIDI": "both",
+}
 
 
 class App:
@@ -1288,10 +1445,10 @@ class App:
         ttk.Button(fr_pb, text="Load", command=self.cargar_seleccion).grid(row=0, column=0, sticky="ew", **pad)
         ttk.Button(fr_pb, text="Play/Pause", command=self.player.play_pause).grid(row=0, column=1, sticky="ew", **pad)
         ttk.Button(fr_pb, text="Restart", command=self.player.restart).grid(row=0, column=2, sticky="ew", **pad)
-        self.btn_conectar = ttk.Button(fr_pb, text="MidiConnect", command=self.toggle_conexion)
+        self.btn_conectar = ttk.Button(fr_pb, text="MidiConnect IN", command=self.toggle_conexion)
         self.btn_conectar.grid(row=0, column=3, sticky="ew", **pad)
         self.v_m2k = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fr_pb, text="Midi2Key", style="Toolbutton", variable=self.v_m2k,
+        ttk.Checkbutton(fr_pb, text="Midi2Key IN", style="Toolbutton", variable=self.v_m2k,
                         command=self.aplicar_m2k).grid(row=0, column=4, sticky="ew", **pad)
         self.cb_disp = ttk.Combobox(fr_pb, state="readonly", values=["No Devices"], width=22)
         self.cb_disp.current(0)
@@ -1383,7 +1540,7 @@ class App:
         self.cb_nm.bind("<<ComboboxSelected>>", self.cambiar_note_mode)
         f_o = ttk.Frame(fr_cfg)
         f_o.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
-        ttk.Label(f_o, text="Salida:").pack(side="left")
+        ttk.Label(f_o, text="Salida canción:").pack(side="left")
         self.cb_salida = ttk.Combobox(f_o, state="readonly", values=list(SALIDAS), width=22)
         self.cb_salida.pack(side="left", padx=4)
         self.cb_salida.bind("<<ComboboxSelected>>", self.cambiar_salida)
@@ -1551,7 +1708,8 @@ class App:
             return
         self.player.load(c)
         self.aj['last_file'] = ruta
-        self.log(f"[Load] Cargado: {c.nombre}")
+        nombre_salida = self.cb_salida.get() or "Teclas (QWERTY)"
+        self.log(f"[Load] Cargado: {c.nombre} — salida canción: {nombre_salida}")
         if c.errores:
             self.log(f"[Fix] Se corrigieron {c.errores} anomalías del MIDI (notas huérfanas/sin cerrar)")
         self._pintar_pistas(c)
@@ -1607,30 +1765,50 @@ class App:
         self.log(f"[MIDI] Dispositivos: {', '.join(self.dispositivos) if self.dispositivos else 'ninguno'}")
 
     def toggle_conexion(self):
-        if self.entrada.port is not None:
+        if self.entrada.midiconnect:
+            self.entrada.set_midiconnect(False)
             self.entrada.desconectar()
-            self.btn_conectar.config(text="MidiConnect")
+            self.btn_conectar.config(text="MidiConnect IN")
+            self.log("[MidiConnect] DESACTIVADO")
+            return
+        if self.entrada.midi2key:
+            messagebox.showwarning("Modos MIDI", "Desactiva Midi2Key antes de activar MidiConnect.")
             return
         nombre = self.cb_disp.get()
         if nombre not in self.dispositivos:
             self.log("⚠ Elige un dispositivo MIDI (o pulsa Refresh MIDI)")
             return
-        if self.entrada.conectar(nombre):
-            self.aj['midi_in'] = nombre
-            self.btn_conectar.config(text="Disconnect")
-            if not self.v_m2k.get():
-                self.v_m2k.set(True)
-                self.aplicar_m2k()
+        if not self.entrada.conectar(nombre):
+            return
+        self.aj['midi_in'] = nombre
+        self.entrada.set_midiconnect(True)
+        self.btn_conectar.config(text="Disconnect IN")
+        self.log("[MidiConnect IN] Teclado MIDI físico conectado; esto controla la entrada en vivo")
 
     def aplicar_m2k(self):
-        self.entrada.midi2key = self.v_m2k.get()
-        if not self.entrada.midi2key:
-            self.entrada.soltar_todo()
-        self.log(f"[Midi2Key] {'ACTIVADO' if self.entrada.midi2key else 'desactivado'}")
+        activar = self.v_m2k.get()
+        if activar and self.entrada.midiconnect:
+            self.v_m2k.set(False)
+            messagebox.showwarning("Modos MIDI", "Desactiva MidiConnect antes de activar Midi2Key.")
+            return
+        if activar:
+            nombre = self.cb_disp.get()
+            if nombre not in self.dispositivos and self.entrada.port is None:
+                self.v_m2k.set(False)
+                self.log("⚠ Elige un teclado MIDI y pulsa Refresh MIDI antes de activar Midi2Key")
+                return
+            if not self.entrada.conectar(nombre):
+                self.v_m2k.set(False)
+                return
+            self.aj['midi_in'] = nombre
+        self.entrada.set_activo(activar)
+        if not activar and not self.entrada.midiconnect and self.entrada.port is not None:
+            self.entrada.desconectar()
+        self.log(f"[Midi2Key IN] {'ACTIVADO' if self.entrada.midi2key else 'desactivado'}; entrada MIDI en vivo")
 
     def aplicar_canal(self, _=None):
         i = self.cb_canal.current()
-        self.entrada.canal = None if i <= 0 else i - 1
+        self.entrada.set_canal(None if i <= 0 else i - 1)
         self.aj['midi_canal'] = i
 
     # ---------- controles ----------
@@ -1697,9 +1875,12 @@ class App:
         modo = SALIDAS.get(self.cb_salida.get(), 'keys')
         self.aj['salida'] = modo
         self.out.set_modo(modo)
+        self.player.update_cfg(salida=modo)
         if self.out.modo != modo:
             self.cb_salida.set(next(k for k, v in SALIDAS.items() if v == self.out.modo))
             self.aj['salida'] = self.out.modo
+        if not silencioso:
+            self.log(f"[Salida] {self.cb_salida.get()} — aplica al reproductor de canciones")
 
     def _click_barra(self, e):
         c = self.player.song
